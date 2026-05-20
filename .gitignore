@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Environment
+.env
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Data / generated outputs
+data/*.csv
+data/*.parquet
+*.pdf
