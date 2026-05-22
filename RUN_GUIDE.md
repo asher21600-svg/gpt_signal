@@ -1,9 +1,10 @@
-# Step-by-Step Reproduction Guide
+# Step-by-Step Run Guide
 
-Companion to `REPRODUCTION_PLAN.md`. The plan explains the *why*; this guide
-gives you the literal sequence of commands plus what to inspect at each step.
+Companion to `REPRODUCTION_PLAN.md` (the *why*) and `REPRODUCTION_REPORT.md` (the *findings*). This file is the *what to type*, in order.
 
-Assume you've cloned this folder and `cd`'d into `gpt_signal/`.
+Assume you've cloned the repo and `cd`'d into `gpt_signal/`.
+
+> **Substitutions from the paper.** This guide uses **DeepSeek-Chat** in place of GPT-4 (functionally equivalent OpenAI-compatible API, ~50× cheaper) and **FinancialModelingPrep `/stable/` Starter ($14/mo)** in place of FactSet (both expose US-listed quarterly fundamentals). Either can be swapped — see Phase 0.
 
 ---
 
@@ -12,361 +13,434 @@ Assume you've cloned this folder and `cd`'d into `gpt_signal/`.
 ### 0.1 Install dependencies
 
 ```bash
-cd gpt_signal/
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 0.2 Add your OpenAI key
+### 0.2 Configure API keys
 
 ```bash
 cp .env.example .env
-# edit .env, set OPENAI_API_KEY=sk-...
 ```
 
-### 0.3 Smoke test (no network, no API)
+Edit `.env` to add **one LLM key** and **one fundamentals data source**:
+
+```
+# LLM (one of these)
+DEEPSEEK_API_KEY=sk-...                # DeepSeek-Chat (recommended, ¥1-2 total)
+# OPENAI_API_KEY=sk-...                # GPT-4 if you have it (and change LLM_MODEL in config.py)
+
+# Fundamentals (one of these; auto-selected by priority FMP > EDGAR > yfinance)
+FMP_API_KEY=...                        # FinancialModelingPrep Starter ($14/mo, fastest)
+EDGAR_USER_AGENT="Your Name your.email@example.com"   # Free fallback (SEC requires identification)
+```
+
+### 0.3 Smoke test (no network, no API spend)
 
 ```bash
 python tests/test_pipeline.py
 ```
 
-Expected output (last 6 lines):
+Expected output:
 
 ```
+Running smoke tests…
   ✓ apply_paper_signals adds 6 columns
   ✓ parse_signal_response + compute_signal
   ✓ Spearman directions correct (roe=+0.16, pe=-0.57)
-  ✓ Fama-MacBeth: median adj_R² ≈ +0.05–0.10
+  ✓ Fama-MacBeth-style: median adj_R² ≈ +0.05
   ✓ compare_models: 7 models, 24 dates
   ✓ Plots rendered at tests/smoke_outputs/
+All smoke tests passed.
 ```
 
-If anything fails here, **stop and fix it** — every later step depends on the
-modules this test exercises.
+If anything fails here, stop and fix it — every later step builds on these modules.
+
+### 0.4 LLM connectivity check (~¥0.001)
+
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+from prompts.step1_definitions import _build_client
+from config import LLM_MODEL
+r = _build_client().chat.completions.create(
+    model=LLM_MODEL,
+    messages=[{'role':'user','content':'Reply with just: OK'}],
+    max_tokens=5,
+)
+print(r.choices[0].message.content)
+"
+```
+
+Should print `OK`. If it prints an auth error, double-check your `.env`.
 
 ---
 
-## Phase 1 — Build the data panel (45 min — 2 hr)
+## Phase 1 — Build the data panels (10 min — 2 hr)
 
-This is the slowest step. yfinance throttles and a few tickers will fail; that's
-normal.
+Two paths. **Pick one based on what you have:**
 
-### 1.1 Pull fundamentals + returns + build the merged panel
+### Path A — Synthetic data (5 min, free, prototyping only)
 
-The orchestrator does this in one shot; you can also call the steps individually
-if you want to inspect intermediates.
+Use this when you don't have FMP/EDGAR keys yet, or to validate the pipeline before spending on API calls.
 
-```python
-# scratch_phase1.py
+```bash
+cat > scratch_phase1_synthetic.py << 'PYEOF'
+from pathlib import Path
+from data.synthetic_panel import build_synthetic_panel
+from evaluation.spearman import cross_sectional_spearman
+from config import SIGNAL_KEYS
+
+for sector in ["IT", "HealthCare", "Energy"]:
+    panel = build_synthetic_panel(sector=sector, n_quarters=20, seed=42)
+    out = Path(f"outputs/{sector}_panel.parquet")
+    panel.to_parquet(out)
+    print(f"{sector}: {panel.shape}  ->  {out}")
+
+# Quick sanity: |Spearman ρ| of 0.05-0.12 confirms paper-like signal strength
+panel = build_synthetic_panel(sector="IT", n_quarters=20, seed=42)
+cs = cross_sectional_spearman(panel, SIGNAL_KEYS, "ret_3m")
+print("\nMean cross-sectional Spearman rho (ret_3m):")
+for col in SIGNAL_KEYS:
+    print(f"  {col:>8s}: {cs[col].mean():+.4f}")
+PYEOF
+python scratch_phase1_synthetic.py
+```
+
+Synthetic data is calibrated to the paper's |ρ| ≤ 0.12 signal-return correlation range. Use it for everything in Phases 2–5; swap in real data later if you want to confirm the paper's specific numbers.
+
+### Path B — Real S&P 500 data via FMP (5–10 min, ~1 min API time)
+
+```bash
+cat > scratch_phase1_real.py << 'PYEOF'
+from pathlib import Path
+import pandas as pd
+from config import SECTORS
 from data.fetch_fundamentals import fetch_fundamentals
 from data.fetch_returns import fetch_quarterly_forward_returns
 from data.build_panel import build_panel
-from config import SECTORS
 
-tickers = SECTORS["IT"]
-fundamentals = fetch_fundamentals(tickers)
-returns = fetch_quarterly_forward_returns(tickers,
-                                          start="2015-12-01",
-                                          end="2021-03-31",
-                                          horizons_months=[1, 3])
-panel = build_panel(fundamentals, returns)
-print(panel.shape)
-print(panel.head())
-panel.to_parquet("outputs/IT_panel.parquet")
+Path("outputs").mkdir(exist_ok=True)
+for sector, tickers in SECTORS.items():
+    print(f"\n=== {sector} — {len(tickers)} tickers ===")
+    fundamentals = fetch_fundamentals(tickers)
+    returns = fetch_quarterly_forward_returns(
+        tickers, start="2013-01-01", end="2025-01-01",
+        horizons_months=[1, 3],
+    )
+    panel = build_panel(fundamentals, returns)
+    out = Path(f"outputs/real_{sector}_panel.parquet")
+    panel.to_parquet(out)
+    print(f"  -> {panel.shape}  "
+          f"Date {panel['date'].min().date()} to {panel['date'].max().date()}  "
+          f"Tickers {panel['ticker'].nunique()} of {len(tickers)}  "
+          f"P/E med {panel['pe'].median():.2f}  ROE med {panel['roe'].median():.3f}")
+PYEOF
+python scratch_phase1_real.py
 ```
 
-```bash
-mkdir -p outputs
-python scratch_phase1.py
-```
+**What you should see:**
 
-### 1.2 Sanity-check the panel
+- IT: ~1,500 rows × 14 columns, 43 of 43 tickers, P/E median 24–28
+- HealthCare: ~1,050 rows, 30–31 tickers, P/E median 25–30
+- Energy: ~560 rows, 16–19 tickers, P/E median 12–15
 
-Things to verify:
+**Things to verify:**
 
-1. **Row count ≈ tickers × quarters.** For IT: ~43 tickers × ~20 quarters
-   (2016 Q1 – 2020 Q4) = ~860 rows. Expect 600–800 after dropping NaNs.
-2. **No look-ahead.** The row at `date=2018-06-30` should have signal values
-   computed from fundamentals filed *by* June 30 and a forward return measured
-   *after* June 30. The `ret_3m` for that row is the return between 2018-06-30
-   and ~2018-09-30.
-3. **Ratio scales look right.** P/E typically 10–40, P/B 1–10, ROE 0.05–0.4
-   (as a fraction, not percent). If anything is off by 100×, you have a units
-   mismatch — check `_quarterly_yf` in `fetch_fundamentals.py`.
+1. **Ratio scales are right.** P/E in the 10–40 range, ROE 0.05–1.5 (fraction, not percent). If off by 100×, check `_FMP_FIELD_MAP` in `data/fetch_fundamentals_fmp.py`.
+2. **All ~93 tickers present.** A few may be missing (delisted tickers PXD, MRO, HES, CTLT, ANSS, JNPR). The bundled adapter uses FMP for prices specifically to recover acquired/delisted symbols — yfinance silently drops them, which would introduce survivorship bias.
+3. **No 100% NaN columns.** If a column is all NaN, the FMP field name probably changed — recheck the field map.
 
-```python
-panel.describe()
-panel.groupby("date").size().tail()      # how many companies per quarter
-panel[["pe","pb","roe","roa","ret_3m"]].describe()
-```
-
-### 1.3 Repeat for HealthCare and Energy
-
-```bash
-# Just change SECTORS["IT"] → SECTORS["HealthCare"] / "Energy"
-```
-
-End of Phase 1: you have 3 parquet files in `outputs/`.
+End of Phase 1: 3 parquet files in `outputs/`.
 
 ---
 
-## Phase 2 — Step-1 prompt: signal definitions (10 min, ~$0.20 in API)
+## Phase 2 — LLM defines the 10 baseline signals (10 min, ~¥0.05)
 
-### 2.1 Generate (or load cached) definitions
+```bash
+cat > scratch_phase2.py << 'PYEOF'
+from prompts.step1_definitions import get_signal_definitions, format_definitions_block
+from config import EXISTING_SIGNALS, LLM_MODEL, LLM_TEMP_DEFINITIONS
+from dotenv import load_dotenv; load_dotenv()
 
-```python
-# scratch_phase2.py
-from prompts.step1_definitions import get_signal_definitions
-from config import EXISTING_SIGNALS, LLM_MODEL
-
-defs = get_signal_definitions(EXISTING_SIGNALS, model=LLM_MODEL)
+defs = get_signal_definitions(EXISTING_SIGNALS, model=LLM_MODEL,
+                              temperature=LLM_TEMP_DEFINITIONS, use_cache=True)
 for key, content in defs.items():
-    print(key, "→", content["definition"][:80], "…")
+    print(f"--- {key} ---")
+    print(f"  definition:         {content.get('definition', '')[:150]}")
+    print(f"  effect_on_returns:  {content.get('effect_on_returns', '')[:150]}")
+    print(f"  preferred_tendency: {content.get('preferred_tendency', '')[:150]}")
+PYEOF
+python scratch_phase2.py
 ```
 
-Output is cached to `prompts/signal_definitions.json` — you only pay once. Open
-that file and read each entry. If GPT-4 wrote anything weird (e.g. confusing P/B
-with B/P), fix it manually before continuing.
+Output cached to `prompts/signal_definitions.json` — paid for once. **Read every entry** before continuing. Watch for:
 
-### 2.2 Render the definitions block that goes into step 2
+- Confused valuation direction (LLM saying "higher P/E predicts higher returns" — wrong sign)
+- B/P vs P/B confusion (book-to-market vs price-to-book)
+- Forgetting a signal exists
 
-```python
-from prompts.step1_definitions import format_definitions_block
-from config import EXISTING_SIGNALS
-print(format_definitions_block(defs, EXISTING_SIGNALS))
-```
-
-This is the text block that becomes the "Definition of all existing signals"
-section of the step-2 prompt. Make sure it's well-formed and roughly the
-length of the equivalent block in Figure 1 of the paper.
+If you spot anything wrong, edit `prompts/signal_definitions.json` by hand. The cached JSON is what gets baked into the Phase 3 prompt.
 
 ---
 
-## Phase 3 — Step-2 prompt: generate new signals (30 min, ~$2–$10 in API)
+## Phase 3 — LLM generates 6 new compound signals (~5 min, ~¥0.5)
 
-### 3.1 Run the generation prompt 6 times with different seeds
-
-```python
-# scratch_phase3.py
+```bash
+cat > scratch_phase3.py << 'PYEOF'
 import json
 import pandas as pd
+from dotenv import load_dotenv; load_dotenv()
 from prompts.step1_definitions import get_signal_definitions
 from prompts.step2_generate import generate_n_signals
 from signals.parse_llm_output import parse_signal_response
 from signals.compute_new import add_signal
 from config import EXISTING_SIGNALS, LLM_MODEL, LLM_TEMP_GENERATION
 
-panel = pd.read_parquet("outputs/IT_panel.parquet")
-defs  = get_signal_definitions(EXISTING_SIGNALS, model=LLM_MODEL)
+panel = pd.read_parquet("outputs/real_IT_panel.parquet")  # or "outputs/IT_panel.parquet" for synthetic
+defs = get_signal_definitions(EXISTING_SIGNALS, model=LLM_MODEL, use_cache=True)
 
 raw_responses = generate_n_signals(
     panel, defs, EXISTING_SIGNALS,
-    model=LLM_MODEL,
-    temperature=LLM_TEMP_GENERATION,
-    n=6,
-    return_col="ret_3m",
-    n_companies=3, n_quarters=8,
+    model=LLM_MODEL, temperature=LLM_TEMP_GENERATION,
+    n=6, return_col="ret_3m", n_companies=3, n_quarters=8,
 )
 
-# Save the raw responses for audit trail
-with open("outputs/IT_new_signals.jsonl", "w") as f:
-    for r in raw_responses:
-        f.write(json.dumps({"response": r}) + "\n")
-```
+with open("outputs/IT_new_signals_raw.jsonl", "w") as f:
+    for i, r in enumerate(raw_responses):
+        f.write(json.dumps({"i": i, "response": r}) + "\n")
 
-### 3.2 Parse formulas, compute values, store the enriched panel
-
-```python
 new_signal_names = []
 panel_enriched = panel.copy()
-
-for raw in raw_responses:
+for i, raw in enumerate(raw_responses):
     parsed = parse_signal_response(raw)
     if parsed is None:
-        print("✗ no formula found in response")
+        print(f"  #{i+1}: ✗ no formula found")
         continue
     name, expr = parsed
     try:
         panel_enriched = add_signal(panel_enriched, name, expr)
         new_signal_names.append(name)
-        print(f"✓ {name} = {expr}")
+        print(f"  #{i+1}: ✓ {name} = {expr}")
     except ValueError as e:
-        print(f"✗ {name}: {e}")
+        print(f"  #{i+1}: ✗ {name}: {e}")
 
 panel_enriched.to_parquet("outputs/IT_panel_with_new.parquet")
-print("Generated:", new_signal_names)
+print(f"\nGenerated {len(set(new_signal_names))} unique signals: {sorted(set(new_signal_names))}")
+PYEOF
+python scratch_phase3.py
 ```
 
-**Watch for:**
-- GPT-4 sometimes returns formulas using undefined names (e.g. `volatility`).
-  These fail parsing and are dropped. If you want fewer failures, edit
-  `prompts/templates.py` to enumerate the allowed symbols even more emphatically.
-- Sometimes GPT-4 produces near-duplicates (PVS twice with different names). Dedupe
-  manually or by running with higher temperature.
-- Names should resemble the paper's family — products/divisions of ratios with
-  occasional `log()`.
+**What to expect:**
 
-### 3.3 (Optional) Use the paper's signals as a reference
-
-If you want to validate the eval pipeline before trusting your own GPT-4 output:
-
-```python
-from signals.existing import apply_paper_signals
-panel_paper = apply_paper_signals(panel)
-panel_paper.to_parquet("outputs/IT_panel_paper_signals.parquet")
-```
-
-This gives you the exact 6 formulas from §5.1 of the paper. Useful as a
-control — if Fama-MacBeth says **these** don't beat baseline either, your
-panel is wrong, not GPT-4.
+- **6 of 6 parseable** in most runs; occasionally 4–5 if the LLM hallucinates `max()` or `mean()` functions our sandboxed evaluator doesn't expose.
+- **Repeated names are normal** at lower temperature. Use higher temp (0.7+) for more diversity.
+- **All formulas should follow the same family:** products of profitability metrics divided by valuation multiples, often wrapped in `log()`. Both GPT-4 (paper) and DeepSeek converge on this — the "Quality at a Reasonable Price" pattern.
+- **`RuntimeWarning: invalid value in log`** — *harmless*, the bundled `compute_new.py` uses a sign-safe `log` wrapper (`sign(x) · log(max(eps, |x|))`) that produces a real number even on negative arguments. Without it, Energy sector returns NaN cascades.
 
 ---
 
-## Phase 4 — Evaluate (30 min)
+## Phase 4 — Evaluate (5 min, no API spend)
 
-### 4.1 Spearman rank correlation heatmaps
-
-```python
-# scratch_phase4_corr.py
-import pandas as pd
-from evaluation.spearman import mean_correlation_matrix
-from evaluation.plots import correlation_heatmap
-from config import SIGNAL_KEYS
-from pathlib import Path
-
-panel = pd.read_parquet("outputs/IT_panel_with_new.parquet")
-new_names = [c for c in panel.columns if c not in (
-    SIGNAL_KEYS + ["date", "ticker", "ret_1m", "ret_3m"])]
-
-# Heatmap 1: existing signals + return  → reproduces Figure 5a
-existing_cm = mean_correlation_matrix(panel, SIGNAL_KEYS + ["ret_3m"])
-correlation_heatmap(existing_cm, "IT — existing signals × ret_3m",
-                    Path("outputs/figures/IT_existing.png"))
-
-# Heatmap 2: new signals + return → reproduces Figure 5b
-new_cm = mean_correlation_matrix(panel, new_names + ["ret_3m"])
-correlation_heatmap(new_cm, "IT — new signals × ret_3m",
-                    Path("outputs/figures/IT_new.png"))
-
-# Combined view → reproduces Figure 3
-combined_cm = mean_correlation_matrix(panel, SIGNAL_KEYS + new_names + ["ret_3m"])
-correlation_heatmap(combined_cm, "IT — all signals × ret_3m",
-                    Path("outputs/figures/IT_all.png"))
-```
-
-**What to check:**
-- The bottom row / right column of each heatmap shows the correlation of each
-  signal with the return. In the paper, **|ρ| ranges roughly 0.0 to 0.12**.
-  If yours is bigger by 5× or 10×, you probably have look-ahead.
-- New signals' magnitudes should be similar to (often slightly larger than)
-  the existing signals'.
-- `EVC` should have one of the largest |ρ| (paper's claim §5.3).
-
-### 4.2 Fama-MacBeth adjusted R² box plots
-
-```python
-# scratch_phase4_fm.py
-import pandas as pd
-from evaluation.fama_macbeth import compare_models
-from evaluation.plots import adj_r2_boxplot
-from config import SIGNAL_KEYS
-from pathlib import Path
-
-panel = pd.read_parquet("outputs/IT_panel_with_new.parquet")
-new_names = [c for c in panel.columns if c not in (
-    SIGNAL_KEYS + ["date", "ticker", "ret_1m", "ret_3m"])]
-
-adj_r2 = compare_models(panel, SIGNAL_KEYS, new_names, "ret_3m")
-adj_r2.to_csv("outputs/IT_adj_r2_ret_3m.csv", index=False)
-adj_r2_boxplot(adj_r2, "IT — Adj R² (ret_3m)",
-               Path("outputs/figures/IT_adj_r2_boxplot.png"))
-
-# Numerical summary
-summary = adj_r2.drop(columns=["date"]).agg(["median", "mean", "std"]).T
-summary["delta_vs_baseline"] = summary["median"] - summary.loc["baseline", "median"]
-print(summary.sort_values("median", ascending=False))
-```
-
-**The headline claim:** 5 of 6 models with a new signal show a higher median
-adjusted R² than baseline. After running, look at the
-`delta_vs_baseline` column — positive for at least 5/6 rows confirms the
-paper's finding.
-
-### 4.3 Repeat for `ret_1m` and the other sectors
-
-```python
-for sector in ["IT", "HealthCare", "Energy"]:
-    for h in ["ret_1m", "ret_3m"]:
-        # ...repeat 4.1 + 4.2 for each (sector, horizon) pair
-        # to reproduce Figures 7–16 in Appendix B
-```
-
-End of Phase 4: 6 box plots and 12 heatmaps, mirroring the paper's Figures
-3–16.
-
----
-
-## Phase 5 — One-command reproduction
-
-Once each phase works, you can do everything end-to-end:
+### 4.1 Single sector × single horizon
 
 ```bash
-python run_all.py --sector IT          --return-horizon ret_3m --out outputs/IT_3m
-python run_all.py --sector IT          --return-horizon ret_1m --out outputs/IT_1m
-python run_all.py --sector HealthCare  --return-horizon ret_3m --out outputs/HC_3m
-python run_all.py --sector HealthCare  --return-horizon ret_1m --out outputs/HC_1m
-python run_all.py --sector Energy      --return-horizon ret_3m --out outputs/EN_3m
-python run_all.py --sector Energy      --return-horizon ret_1m --out outputs/EN_1m
+cat > scratch_phase4.py << 'PYEOF'
+from pathlib import Path
+import pandas as pd
+from config import SIGNAL_KEYS
+from evaluation.spearman import mean_correlation_matrix, cross_sectional_spearman
+from evaluation.fama_macbeth import compare_models
+from evaluation.plots import correlation_heatmap, adj_r2_boxplot
 
-# Or sanity-check with the paper's exact formulas (no API spend):
-python run_all.py --sector IT --use-paper-signals --out outputs/IT_paper
+panel = pd.read_parquet("outputs/IT_panel_with_new.parquet")
+META = {"date", "ticker", "ret_1m", "ret_3m"}
+new_names = [c for c in panel.columns if c not in META and c not in SIGNAL_KEYS]
+figdir = Path("outputs/figures"); figdir.mkdir(parents=True, exist_ok=True)
+
+# Heatmaps (Spearman rank correlation, averaged across dates)
+for cols, label in [
+    (SIGNAL_KEYS + ["ret_3m"], "existing"),
+    (new_names + ["ret_3m"], "new"),
+    (SIGNAL_KEYS + new_names + ["ret_3m"], "all"),
+]:
+    cm = mean_correlation_matrix(panel, cols)
+    correlation_heatmap(cm, f"IT — {label} × ret_3m",
+                        figdir / f"IT_corr_{label}.png")
+
+# Fama-MacBeth: baseline (10 signals) vs baseline + each new signal
+adj_r2 = compare_models(panel, SIGNAL_KEYS, new_names, "ret_3m")
+adj_r2.to_csv("outputs/IT_adj_r2.csv", index=False)
+adj_r2_boxplot(adj_r2, "IT — Adj R² (ret_3m)",
+               figdir / "IT_adj_r2_boxplot.png")
+
+# Summary table
+summary = adj_r2.drop(columns=["date"]).agg(["median", "mean", "std"]).T
+baseline_med = summary.loc["baseline", "median"]
+summary["delta_vs_baseline"] = summary["median"] - baseline_med
+summary = summary.sort_values("median", ascending=False).round(4)
+print(summary)
+print(f"\nModels beating baseline (median Δ > 0): "
+      f"{(summary['delta_vs_baseline'] > 0).sum()} of {len(summary) - 1}")
+PYEOF
+python scratch_phase4.py
 ```
 
+### 4.2 Cross-sector × both horizons
+
+```bash
+cat > scratch_phase4_all_sectors.py << 'PYEOF'
+import json
+from pathlib import Path
+import pandas as pd
+from config import SIGNAL_KEYS
+from signals.parse_llm_output import parse_signal_response
+from signals.compute_new import add_signal
+from evaluation.fama_macbeth import compare_models
+from evaluation.plots import adj_r2_boxplot
+
+formulas = {}
+with open("outputs/IT_new_signals_raw.jsonl") as f:
+    for line in f:
+        parsed = parse_signal_response(json.loads(line)["response"])
+        if parsed:
+            formulas[parsed[0]] = parsed[1]
+
+figdir = Path("outputs/figures"); figdir.mkdir(parents=True, exist_ok=True)
+combined = []
+for sector in ["IT", "HealthCare", "Energy"]:
+    for horizon in ["ret_3m", "ret_1m"]:
+        panel = pd.read_parquet(f"outputs/real_{sector}_panel.parquet")
+        new_names = []
+        for name, expr in formulas.items():
+            try:
+                panel = add_signal(panel, name, expr); new_names.append(name)
+            except ValueError: pass
+        adj_r2 = compare_models(panel, SIGNAL_KEYS, new_names, horizon)
+        adj_r2_boxplot(adj_r2, f"{sector} — Adj R² ({horizon})",
+                       figdir / f"real_{sector}_adj_r2_{horizon}.png")
+        s = adj_r2.drop(columns=["date"]).agg(["median"]).T
+        baseline_med = s.loc["baseline", "median"]
+        s["delta"] = s["median"] - baseline_med
+        for name in new_names:
+            combined.append({
+                "sector": sector, "horizon": horizon, "model": name,
+                "median": s.loc[name, "median"], "delta": s.loc[name, "delta"],
+            })
+
+df = pd.DataFrame(combined)
+df.to_csv("outputs/real_cross_sector_summary.csv", index=False)
+win_pct = (df["delta"] > 0).mean() * 100
+print(df.pivot_table(index="model", columns=["sector","horizon"], values="delta").round(4))
+print(f"\nWin rate across all cells: {(df['delta'] > 0).sum()}/{len(df)} = {win_pct:.1f}%")
+PYEOF
+python scratch_phase4_all_sectors.py
+```
+
+End of Phase 4: a 6-row × 5-column delta matrix, a single headline win-rate %, 6 PNG figures.
+
+**Reference numbers (what we hit):**
+
+- Real-data 2016–2024: win rate **26.7%**. PAVS-family is the only signal beating baseline more than 50% of the time across cells.
+- Paper-window 2016–2020: win rate **76–87%** across 4 temperatures — matches the paper's 83% claim.
+
 ---
 
-## Phase 6 — Validation against the paper
+## Phase 5 — Generate the shareable report (1 min, no API spend)
 
-Open each output's `summary.csv` and confirm:
+```bash
+python build_report.py        # outputs/reproduction_report.html (self-contained, ~1-5 MB)
+python build_pdf.py           # outputs/reproduction_report.pdf  (via Chrome-headless or weasyprint)
+open outputs/reproduction_report.pdf
+```
 
-| Check | What to expect |
+What's in it:
+
+- TL;DR hero stats (paper claim vs your in-window vs your extended-window numbers)
+- All Spearman heatmaps + Fama-MacBeth box plots embedded as base64 PNGs
+- Per-sector × per-horizon cell-by-cell delta table with green/red coloring
+- Cross-run findings section
+- Conclusion
+
+Suitable for sharing in chat, attaching to email, or printing.
+
+---
+
+## Phase 6 — Extension experiments (~5 min, ~¥3)
+
+The most informative bits beyond a vanilla reproduction.
+
+### 6.1 Filter to the paper's exact window (2016–2020)
+
+```bash
+cat > scratch_extension_filter.py << 'PYEOF'
+from pathlib import Path
+import pandas as pd
+for sector in ["IT", "HealthCare", "Energy"]:
+    panel = pd.read_parquet(f"outputs/real_{sector}_panel.parquet")
+    panel = panel[(panel["date"] >= "2016-01-01") & (panel["date"] <= "2020-12-31")].copy()
+    panel.to_parquet(f"outputs/paper_{sector}_panel.parquet")
+    print(f"{sector}: {len(panel)} rows  ({panel['date'].min().date()} to {panel['date'].max().date()})")
+PYEOF
+python scratch_extension_filter.py
+```
+
+### 6.2 Temperature sweep on the paper window
+
+```bash
+# Generate 6 signals at each of T ∈ {0.0, 0.3, 0.7, 1.0}
+python scratch_extension_temp_sweep.py
+
+# Evaluate each temp's signals across all sectors × horizons
+python scratch_extension_eval.py
+```
+
+End of Phase 6: a 4-row table comparing win rates per temperature. We hit 76–87% across all four, confirming temperature isn't the load-bearing knob — the paper's headline reproduces robustly within its window regardless of temperature.
+
+---
+
+## Phase 7 — Validation checklist
+
+Open `outputs/reproduction_report.pdf` and confirm:
+
+| Check | Pass if |
 |---|---|
-| ≥5 of 6 new signals beat baseline median adj R² | Yes for IT; appendix shows similar in HC, Energy |
-| EVC has top Spearman |ρ| with returns | Yes in IT (paper §5.3) |
-| Adjusted R² values in range | Roughly 0.03–0.20; if you see 0.8 something is wrong |
-| Heatmap visual structure matches paper figures | Similar dominant colors, similar last-column profile |
+| In-window win rate is in the 70–90% range | Yes for paper window 2016–2020 |
+| Out-of-window win rate is lower | Yes for 2016–2024; ours was 26.7% (alpha decay) |
+| At least one signal beats baseline at both horizons | Yes — sign-safe PAVS family |
+| `EVC` or similar has top Spearman \|ρ\| | Yes in IT (matches paper §5.3) |
+| Adj R² magnitudes are reasonable | Roughly −0.2 to +0.2; if you see ±0.8 something's wrong |
+| Energy doesn't produce all-NaN signals | If yes, sign-safe `log` in `signals/compute_new.py` is missing |
 
-If you reproduce 3/4 of those qualitatively, you've reproduced the paper. The
-remaining noise is GPT-4 nondeterminism + your data source.
-
----
-
-## Phase 7 — Things to try after reproduction works
-
-These are the natural extensions (also in REPRODUCTION_PLAN.md §12):
-
-1. **Out-of-sample test.** Generate signals using only 2016–2018 data in the
-   prompt; evaluate on 2019–2020. The paper trains-and-tests on the same
-   window — this is the biggest methodological weakness.
-2. **Temperature ablation.** Run `generate_n_signals` with `temperature=0`,
-   `0.3`, `0.7`, `1.0`. Plot how formula complexity changes.
-3. **Different LLM.** Swap `LLM_MODEL` to Claude or a local model and compare
-   the generated-formula distribution.
-4. **Honest baseline.** Add Fama-French 5-factor or WorldQuant Alpha 101 as a
-   comparison instead of just the 10 ratios — both are well-known and free.
+If 4 of 6 of those check out, you've reproduced the paper.
 
 ---
 
-## Costs and time budget
+## Costs and time budget (actual, with DeepSeek + FMP)
 
-| Phase | Time | API spend |
+| Phase | Time | Spend |
 |---|---|---|
-| 0 — Env | 15 min | $0 |
-| 1 — Data | 1–2 hr | $0 (yfinance free; FMP free tier OK) |
-| 2 — Definitions | 10 min | ~$0.20 |
-| 3 — Signal gen | 30 min × 3 sectors | $2–$10 total |
-| 4 — Evaluation | 30 min | $0 |
-| 5 — One-shot all sectors | 10 min | repeats |
-| 6 — Validation | 30 min | $0 |
+| 0 — Env + smoke test | 15 min | ¥0 |
+| 1 — Data (FMP Starter) | 5–10 min | $14/mo subscription |
+| 2 — Definitions | 10 min | ~¥0.05 |
+| 3 — Signal generation (×6) | 5 min | ~¥0.5 |
+| 4 — Evaluation (3 sectors × 2 horizons) | 5 min | ¥0 |
+| 5 — Report | 1 min | ¥0 |
+| 6 — Extension (4-temp sweep) | 5 min | ~¥3 |
 
-**Total: a focused weekend.**
+**Total LLM spend: under ¥5.** First-time data pull from FMP ~1 minute; subsequent runs hit disk cache and are instant.
+
+---
+
+## Common errors and fixes
+
+| Error | Fix |
+|---|---|
+| `Premium Query Parameter: 'Special Endpoint'` | FMP free tier blocks `period=quarter`. Upgrade to Starter ($14/mo) or use the EDGAR adapter. |
+| `Legacy Endpoint : Due to Legacy endpoints being no longer supported` | You're hitting the old `/api/v3/` URLs. The bundled adapter uses `/stable/` already; if you forked an older version, update the `BASE_URL`. |
+| `pe is NaN for all rows` | FMP field name mismatch — `priceEarningsRatio` was renamed to `priceToEarningsRatio` in `/stable/`. See `data/fetch_fundamentals_fmp.py`. |
+| `Empty panel after build_panel` | Date alignment between fundamentals (fiscal quarter-ends) and returns (calendar quarter-ends). `build_panel.py` rounds both via `dt.to_period("Q").dt.end_time` — make sure both inputs go through it. |
+| `log(negative) = NaN` cascades in Energy | Use the sign-safe `_safe_log` in `signals/compute_new.py`. The wrapper is `sign(x) · log(max(eps, \|x\|))`. |
+| `Authentication failed for github` on `git push` | GitHub removed password auth in August 2021. Use `gh auth login` or a Personal Access Token as your password. |
+| `Repository not found` on `git push` | Create the repo first via `gh repo create <user>/gpt_signal --public --source=.` or manually at github.com/new (don't pre-populate README/LICENSE). |
